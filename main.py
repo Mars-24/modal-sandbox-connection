@@ -1,7 +1,6 @@
-
 # main.py
 import os
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
@@ -13,8 +12,8 @@ from dotenv import load_dotenv
 # Charger les variables d'environnement
 # --------------------------
 load_dotenv()
-JWT_SECRET = os.getenv("JWT_SECRET")           # Secret partagé pour JWT
-JWT_ALGO = os.getenv("JWT_ALGO", "HS256")      # Algorithme JWT
+JWT_SECRET = os.getenv("JWT_SECRET", "changeme")
+JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
 
 # --------------------------
 # Auth JWT
@@ -34,7 +33,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # front-end
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,18 +42,28 @@ app.add_middleware(
 # --------------------------
 # Modal sandbox
 # --------------------------
-# Image avec vos dépendances (requirements.txt doit contenir openai par exemple)
-image = modal.Image.debian_slim().pip_install_from_requirements("requirements.txt")
+#image = modal.Image.debian_slim().pip_install_from_requirements("requirements.txt")
+image = (
+    modal.Image.debian_slim()
+    # Installer curl pour NodeSource
+    .apt_install("curl", "unzip","wget")
 
-# Créer un volume persistant pour stocker fichiers
+    # Installer Node.js 20 et npm
+    .run_commands([
+        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+        "apt-get install -y nodejs"
+    ])
+    # Installer les dépendances Python
+    .pip_install_from_requirements("requirements.txt")
+)
 volume = modal.Volume.from_name("sandbox-storage", create_if_missing=True)
-
 app_modal = modal.App("sandbox-microservice", image=image)
 
 # --------------------------
-# Fonctions sandbox
+# Fonctions Modal
 # --------------------------
-# Fonction IA pour compléter un prompt
+
+# Prompt IA
 @app_modal.function(secrets=[modal.Secret.from_name("openai-secret")])
 def complete_text(prompt: str):
     from openai import OpenAI
@@ -65,7 +74,7 @@ def complete_text(prompt: str):
     )
     return chat_completion.choices[0].message.content
 
-# Fonction pour écrire un fichier dans le volume
+# Écrire un fichier texte
 @app_modal.function(volumes={"/sandbox": volume})
 def write_file(filename: str, content: str):
     path = f"/sandbox/{filename}"
@@ -73,7 +82,7 @@ def write_file(filename: str, content: str):
         f.write(content)
     return f"File '{filename}' saved."
 
-# Fonction pour lire un fichier depuis le volume
+# Lire un fichier texte
 @app_modal.function(volumes={"/sandbox": volume})
 def read_file(filename: str):
     path = f"/sandbox/{filename}"
@@ -81,6 +90,107 @@ def read_file(filename: str):
         return f"File '{filename}' not found."
     with open(path, "r") as f:
         return f.read()
+
+# Copier un projet local dans la sandbox
+@app_modal.function(volumes={"/sandbox": volume})
+def copy_project(local_path: str, remote_path: str = "/sandbox/project"):
+    import shutil
+    if os.path.exists(remote_path):
+        shutil.rmtree(remote_path)
+    shutil.copytree(local_path, remote_path)
+    return f"Project copied to {remote_path}"
+
+# Lancer le projet Next.js
+@app_modal.function(volumes={"/sandbox": volume}, timeout=1800)
+def start_nextjs():
+    import subprocess
+    os.chdir("/sandbox/project")
+    subprocess.run(["npm", "install"], check=True)
+    subprocess.run(["npm", "run", "dev"], check=True)
+    # Dans start_nextjs()
+    subprocess.Popen(["npm", "run", "start", "--", "-p", "3000", "--hostname", "0.0.0.0"])
+
+    return "Next.js started"
+
+@app_modal.function(volumes={"/sandbox": volume})
+def start_nextjs_with_ngrok():
+    import os
+    import subprocess
+    import time
+    import json
+
+    os.chdir("/sandbox/project")
+
+    # Installer ngrok si pas déjà présent
+    if not os.path.exists("/usr/local/bin/ngrok"):
+        subprocess.run([
+            "wget",
+            "https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip",
+            "-O", "/tmp/ngrok.zip"
+        ], check=True)
+        subprocess.run(["unzip", "-o", "/tmp/ngrok.zip", "-d", "/usr/local/bin/"], check=True)
+
+    # Installer requests si nécessaire
+    try:
+        import requests
+    except ImportError:
+        subprocess.run(["pip", "install", "requests"], check=True)
+        import requests
+
+    # Lancer Next.js sur 0.0.0.0:3000
+    subprocess.Popen(["npm", "run", "start", "--", "-p", "3000", "--hostname", "0.0.0.0"])
+
+    # Lancer ngrok pour exposer le port 3000
+    subprocess.Popen(["/usr/local/bin/ngrok", "http", "3000"])
+
+    # Attendre que ngrok démarre
+    time.sleep(5)
+
+    # Lire l'URL publique depuis ngrok
+    try:
+        r = requests.get("http://localhost:4040/api/tunnels")
+        tunnels = r.json().get("tunnels", [])
+        public_url = tunnels[0]["public_url"] if tunnels else "ngrok tunnel not found"
+    except Exception:
+        public_url = "ngrok tunnel not found"
+
+    return f"Next.js started! Access it via: {public_url}"
+
+    
+# Upload et décompression d’un zip Next.js
+@app_modal.function(volumes={"/sandbox": volume})
+def upload_and_extract_zip(file_bytes: bytes, filename: str, target_path: str = "/sandbox/project"):
+    import shutil
+    import zipfile
+
+    # Supprimer le projet existant si nécessaire
+    if os.path.exists(target_path):
+        shutil.rmtree(target_path)
+
+    # Écrire le zip dans la sandbox
+    tmp_zip_path = f"/sandbox/{filename}"
+    with open(tmp_zip_path, "wb") as f:
+        f.write(file_bytes)
+
+    # Décompresser le zip
+    with zipfile.ZipFile(tmp_zip_path, "r") as zip_ref:
+        zip_ref.extractall(target_path)
+
+    # Supprimer le zip après extraction
+    os.remove(tmp_zip_path)
+
+    return f"Projet '{filename}' uploadé et décompressé dans {target_path}"
+
+# Copier un projet prébuild dans la sandbox
+@app_modal.function(volumes={"/sandbox": volume})
+def copy_project_to_sandbox():
+    import shutil
+    local_path = "../prebuilt"
+    remote_path = "/sandbox/project"
+    if os.path.exists(remote_path):
+        shutil.rmtree(remote_path)
+    shutil.copytree(local_path, remote_path)
+    return f"Project copied to {remote_path}"
 
 # --------------------------
 # Endpoints FastAPI
@@ -90,27 +200,55 @@ class SandboxRequest(BaseModel):
 
 class FileRequest(BaseModel):
     filename: str
-    content: str = None  # facultatif pour read
+    content: str = None
 
-# Lancer un prompt IA
+# Prompt IA
 @app.post("/sandbox/prompt")
 def sandbox_prompt(data: SandboxRequest, user=Depends(get_current_user)):
     with app_modal.run():
-        result = complete_text.remote(data.prompt)  # renvoie déjà le résultat
-    return { "response": result}
+        result = complete_text.remote(data.prompt)
+    return {"response": result}
 
-# Créer ou éditer un fichier
+# Écrire un fichier texte
 @app.post("/sandbox/write")
 def sandbox_write_file(data: FileRequest, user=Depends(get_current_user)):
     if data.content is None:
-        raise HTTPException(status_code=400, detail="Content is required to write a file")
+        raise HTTPException(status_code=400, detail="Content is required")
     with app_modal.run():
         result = write_file.remote(data.filename, data.content)
-    return { "message": result}
+    return {"message": result}
 
-# Lire un fichier
+# Lire un fichier texte
 @app.get("/sandbox/read")
 def sandbox_read_file(filename: str, user=Depends(get_current_user)):
     with app_modal.run():
         result = read_file.remote(filename)
     return {"content": result}
+
+# Upload d’un zip Next.js
+@app.post("/sandbox/upload")
+def upload_next_project(file: UploadFile):
+    with app_modal.run():
+        file_bytes = file.file.read()
+        result = upload_and_extract_zip.remote(file_bytes, file.filename)
+    return {"message": result}
+
+# Copier projet prébuild
+@app.post("/sandbox/project/copy")
+def sandbox_copy_project(user=Depends(get_current_user)):
+    with app_modal.run():
+        result = copy_project_to_sandbox.remote()
+    return {"message": result}
+
+# Lancer Next.js
+@app.post("/sandbox/project/run")
+def sandbox_run_project(user=Depends(get_current_user)):
+    with app_modal.run():
+        result = start_nextjs.remote()
+    return {"message": result}
+
+@app.post("/sandbox/project/run/ngrok")
+def sandbox_run_project(user=Depends(get_current_user)):
+    with app_modal.run():
+        url = start_nextjs_with_ngrok.remote()
+    return {"ngrok_url": url}
